@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import List, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class FoldDirection(str, Enum):
@@ -28,6 +28,18 @@ class PunchPoint(BaseModel):
     y: int = Field(..., ge=0, examples=[0])
 
 
+class DepthPunchPoint(PunchPoint):
+    """可携带限深的打孔点：depth 省略时贯穿全部叠层。"""
+
+    depth: int | None = Field(
+        default=None,
+        ge=1,
+        description="限深：只打穿最终折叠面自上而下前 depth 层"
+        "（1..2^折叠步数），省略时贯穿全部层",
+        examples=[2],
+    )
+
+
 class UnfoldRequest(BaseModel):
     board: Board
     folds: List[FoldDirection] = Field(
@@ -35,12 +47,24 @@ class UnfoldRequest(BaseModel):
         max_length=64,
         description="按执行顺序给出的折叠方向序列",
     )
-    punches: List[PunchPoint] = Field(
+    punches: List[DepthPunchPoint] = Field(
         ...,
         min_length=1,
         max_length=1024,
-        description="最终折叠面上的打孔点（局部坐标）",
+        description="最终折叠面上的打孔点（局部坐标），每个点可携带可选 depth 限深",
     )
+
+    @model_validator(mode="after")
+    def _depth_within_stack(self) -> "UnfoldRequest":
+        max_depth = 1 << len(self.folds)
+        for idx, punch in enumerate(self.punches):
+            if punch.depth is not None and punch.depth > max_depth:
+                raise ValueError(
+                    f"打孔点 #{idx} 的 depth={punch.depth} 超出范围："
+                    f"折叠步数 {len(self.folds)} 对应叠层数 {max_depth}，"
+                    f"depth 取值范围为 1..{max_depth}"
+                )
+        return self
 
     model_config = {
         "json_schema_extra": {
@@ -48,7 +72,7 @@ class UnfoldRequest(BaseModel):
                 {
                     "board": {"width": 8, "height": 4},
                     "folds": ["left", "down"],
-                    "punches": [{"x": 1, "y": 0}],
+                    "punches": [{"x": 1, "y": 0, "depth": 2}],
                 }
             ]
         }
@@ -70,6 +94,7 @@ class HolePath(BaseModel):
 
     punch: int = Field(..., description="对应请求中 punches 的下标")
     punch_point: PunchPoint
+    layer: int = Field(..., description="该分支在最终叠层中的层号（自上而下，1 为最上层）")
     steps: List[PathStep]
 
 

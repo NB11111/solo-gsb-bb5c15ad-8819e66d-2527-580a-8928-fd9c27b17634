@@ -10,6 +10,11 @@
 - right ：左半部分向右折，折叠面落在右半区；
 - up    ：下半部分向上折，折叠面落在上半区；
 - down  ：上半部分向下折，折叠面落在下半区。
+
+叠层约定（限深打孔）：
+- 每一步折叠先将被移动半区的叠层翻面（层序反转），再叠到固定半区之上；
+- 最终折叠面的叠层自上而下编号为 1..2^len(folds)；
+- 打孔点可携带 depth，只传播到前 depth 层对应的原板坐标，省略时贯穿全部层。
 """
 from __future__ import annotations
 
@@ -79,11 +84,28 @@ def fold_regions(width: int, height: int, folds: list[str]) -> list[Region]:
     return regions
 
 
+def layer_number(steps: list[dict]) -> int:
+    """由按折叠原始顺序排列的分支记录计算该路径的最终层号（1 = 最上层）。
+
+    第 k 步折叠前叠层高度为 2^k：被移动半区翻面（层序反转）后叠到固定半区
+    之上，因此 stay 分支落在下半叠（位置 +2^k），mirror 分支落在上半叠且
+    位置反转（2^k - 1 - pos）。
+    """
+    pos = 0
+    for k, step in enumerate(steps):
+        if step["branch"] == "stay":
+            pos = (1 << k) + pos
+        else:
+            pos = (1 << k) - 1 - pos
+    return pos + 1
+
+
 def unfold_board(
     width: int,
     height: int,
     folds: list[str],
     punches: list[tuple[int, int]],
+    depths: list[int | None] | None = None,
 ) -> dict:
     """逆序展开折叠序列，通过镜像传播孔位。
 
@@ -91,13 +113,35 @@ def unfold_board(
         width/height：原始板材的整数网格尺寸。
         folds：按执行顺序给出的折叠方向序列。
         punches：最终折叠面上的打孔点（折叠面局部坐标）。
+        depths：与 punches 等长的可选限深序列；depths[i] 为 None 时该点贯穿
+            全部 2^len(folds) 层，否则只传播到自上而下前 depths[i] 层。
 
     返回：
         包含 final_face、stack_layers、total_holes、unique_holes、holes 的字典。
-        重合坐标被合并为一个 hole，其 paths 保留每一条传播路径。
+        重合坐标被合并为一个 hole，其 paths 保留每一条传播路径，path["layer"]
+        为该分支在最终叠层中的层号（1 = 最上层）。
     """
     regions = fold_regions(width, height, folds)
     final = regions[-1]
+
+    if depths is None:
+        depths = [None] * len(punches)
+    elif len(depths) != len(punches):
+        raise FoldError(
+            "invalid_depth",
+            f"depths 数量 {len(depths)} 与打孔点数量 {len(punches)} 不一致。",
+        )
+    max_depth = 1 << len(folds)
+    for idx, depth in enumerate(depths):
+        if depth is not None and not 1 <= depth <= max_depth:
+            raise FoldError(
+                "invalid_depth",
+                f"打孔点 #{idx} 的 depth={depth} 非法："
+                f"取值范围为 1..2^{len(folds)}={max_depth}。",
+                punch=idx,
+                depth=depth,
+                max_depth=max_depth,
+            )
 
     for idx, (px, py) in enumerate(punches):
         if not (0 <= px < final.width and 0 <= py < final.height):
@@ -135,14 +179,22 @@ def unfold_board(
                 nxt.append((x, my, idx, steps + [mirror]))
         states = nxt
 
-    # 合并重合坐标，保留各自传播路径
+    # 合并重合坐标，保留各自传播路径；限深打孔只保留前 depth 层
     merged: dict[tuple[int, int], list[dict]] = {}
+    total_holes = 0
     for x, y, idx, steps in states:
+        # 反转为请求中折叠的原始顺序，便于阅读
+        ordered = list(reversed(steps))
+        layer = layer_number(ordered)
+        depth = depths[idx]
+        if depth is not None and layer > depth:
+            continue
+        total_holes += 1
         path = {
             "punch": idx,
             "punch_point": {"x": punches[idx][0], "y": punches[idx][1]},
-            # 反转为请求中折叠的原始顺序，便于阅读
-            "steps": list(reversed(steps)),
+            "layer": layer,
+            "steps": ordered,
         }
         merged.setdefault((x, y), []).append(path)
 
@@ -158,7 +210,7 @@ def unfold_board(
             "height": final.height,
         },
         "stack_layers": 1 << len(folds),
-        "total_holes": len(states),
+        "total_holes": total_holes,
         "unique_holes": len(holes),
         "holes": holes,
     }

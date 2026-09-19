@@ -2,7 +2,9 @@
 
 基于 Python + FastAPI 的 HTTP 服务：客户端提交整数网格矩形板材、依次执行的上下/左右对折方向，以及最终折叠面上的打孔点；服务端**逆序展开**折叠序列，通过**镜像传播**孔位，自动**拒绝当前折叠轴长度为奇数**的折叠步骤，并将展开后**重合的坐标合并**（各自传播路径完整保留）。
 
-返回内容：展开后的唯一孔位、每个孔位的覆盖层数，以及每个孔位的来源路径（来自哪个打孔点、每一步折叠走了哪一侧）。
+每个打孔点可携带可选的 **`depth` 限深**：层序按实际折叠构造（每步先将被移动半区的叠层翻面反转、再叠到固定半区之上），最终叠层自上而下编号，`depth` 只打穿前 `depth` 层对应的原板坐标；省略时贯穿全部层。
+
+返回内容：展开后的唯一孔位、每个孔位的覆盖层数，以及每个孔位的来源路径（来自哪个打孔点、该分支的最终层号、每一步折叠走了哪一侧）。
 
 另提供**反向打孔规划**接口：提交期望在展开板材上出现的目标孔位，服务端沿折叠过程将目标归并到最终折叠面的等价位置，复算校验镜像轨道完整后，返回最小且唯一的打孔点列表。
 
@@ -44,7 +46,7 @@ docker compose up --build
 {
   "board": { "width": 8, "height": 4 },
   "folds": ["left", "down"],
-  "punches": [{ "x": 1, "y": 0 }]
+  "punches": [{ "x": 1, "y": 0, "depth": 2 }]
 }
 ```
 
@@ -52,7 +54,7 @@ docker compose up --build
 | --- | --- |
 | `board` | 原始板材的整数网格尺寸，`width`/`height` 为正整数 |
 | `folds` | 按执行顺序给出的对折方向：`up` / `down` / `left` / `right`，可为空数组 |
-| `punches` | 最终折叠面上的打孔点，使用折叠面**局部坐标**（左上角为 `(0,0)`），至少 1 个 |
+| `punches` | 最终折叠面上的打孔点，使用折叠面**局部坐标**（左上角为 `(0,0)`），至少 1 个；每个点可携带可选 `depth`（`1..2^折叠步数`），只打穿前 `depth` 层，省略时贯穿全部层 |
 
 **坐标与折叠语义约定**
 
@@ -61,14 +63,21 @@ docker compose up --build
 - 每次对折要求当前对应边长为**偶数**（左右折看当前宽度，上下折看当前高度），否则该步骤被拒绝并返回 400。
 - 响应中的孔位坐标为**原始板材坐标系**。
 
+**叠层与限深约定**
+
+- 层序按实际折叠构造：每一步先将被移动半区的叠层**翻面（层序反转）**，再叠到固定半区**之上**；最终折叠面的叠层**自上而下**编号为 `1..2^折叠步数`。
+- 打孔点携带 `depth` 时，孔位只传播到前 `depth` 层对应的原板坐标；省略 `depth` 时贯穿全部层（与未带 `depth` 的旧请求行为一致）。
+- 重复打孔点或不同 `depth` 命中同一坐标时，仍按坐标归并：`layers` 累计重合次数，全部来源路径保留。
+- `depth` 非法（小于 1 或大于 `2^折叠步数`）时返回 422。
+
 **响应示例**（上面请求的返回，节选）
 
 ```json
 {
   "final_face": { "x": 0, "y": 2, "width": 4, "height": 2 },
   "stack_layers": 4,
-  "total_holes": 4,
-  "unique_holes": 4,
+  "total_holes": 2,
+  "unique_holes": 2,
   "holes": [
     {
       "x": 1,
@@ -78,8 +87,25 @@ docker compose up --build
         {
           "punch": 0,
           "punch_point": { "x": 1, "y": 0 },
+          "layer": 1,
           "steps": [
             { "fold": 0, "direction": "left", "branch": "stay" },
+            { "fold": 1, "direction": "down", "branch": "mirror" }
+          ]
+        }
+      ]
+    },
+    {
+      "x": 6,
+      "y": 1,
+      "layers": 1,
+      "paths": [
+        {
+          "punch": 0,
+          "punch_point": { "x": 1, "y": 0 },
+          "layer": 2,
+          "steps": [
+            { "fold": 0, "direction": "left", "branch": "mirror" },
             { "fold": 1, "direction": "down", "branch": "mirror" }
           ]
         }
@@ -95,7 +121,7 @@ docker compose up --build
 | `stack_layers` | 折叠后每处的纸层数 = 2^折叠步数 |
 | `total_holes` / `unique_holes` | 展开孔位总数（按路径计）/ 去重后的唯一孔位数 |
 | `holes[].layers` | 覆盖该坐标的传播路径数（重合次数） |
-| `holes[].paths[]` | 来源路径：`punch` 为请求中打孔点下标；`steps` 按折叠原始顺序记录每一步的分支，`stay` = 未移动的一层，`mirror` = 被折过来的一层 |
+| `holes[].paths[]` | 来源路径：`punch` 为请求中打孔点下标；`layer` 为该分支在最终叠层中的层号（自上而下，1 为最上层）；`steps` 按折叠原始顺序记录每一步的分支，`stay` = 未移动的一层，`mirror` = 被折过来的一层 |
 
 **curl 示例**
 
@@ -105,7 +131,7 @@ curl -X POST http://localhost:8000/api/v1/unfold \
   -d '{
     "board": {"width": 8, "height": 4},
     "folds": ["left", "down"],
-    "punches": [{"x": 1, "y": 0}]
+    "punches": [{"x": 1, "y": 0, "depth": 2}]
   }'
 ```
 
@@ -114,7 +140,7 @@ curl -X POST http://localhost:8000/api/v1/unfold \
 - `400 odd_fold_axis`：某一步折叠时当前轴长为奇数，`detail` 中带 `step` / `direction` / `axis` / `axis_length`。
 - `400 punch_out_of_bounds`：打孔点超出最终折叠面范围。
 - `400 limit_exceeded`：超出 `MAX_FOLDS` / `MAX_PUNCHES` / `MAX_TOTAL_HOLES` 限制。
-- `422`：请求体不符合 schema（如非法方向、负坐标、空打孔列表）。
+- `422`：请求体不符合 schema（如非法方向、负坐标、空打孔列表、非法 `depth`）。
 
 ```json
 {

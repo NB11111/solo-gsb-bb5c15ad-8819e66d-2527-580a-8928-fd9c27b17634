@@ -78,8 +78,9 @@ def unfold(req: UnfoldRequest) -> dict:
 
     folds = [f.value for f in req.folds]
     punches = [(p.x, p.y) for p in req.punches]
+    depths = [p.depth for p in req.punches]
     try:
-        result = unfold_board(req.board.width, req.board.height, folds, punches)
+        result = unfold_board(req.board.width, req.board.height, folds, punches, depths)
     except FoldError as exc:
         raise HTTPException(
             status_code=400,

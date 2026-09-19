@@ -104,6 +104,101 @@ def test_multiple_distinct_punches():
     assert res["unique_holes"] == 8
 
 
+def test_layer_numbers_top_to_bottom():
+    # 8x4，["left", "down"]：折叠面 (1,0) 的叠层自上而下为 (1,1) (6,1) (6,2) (1,2)
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0)])
+    layers = {(h["x"], h["y"]): h["paths"][0]["layer"] for h in res["holes"]}
+    assert layers == {(1, 1): 1, (6, 1): 2, (6, 2): 3, (1, 2): 4}
+
+
+def test_layer_order_matches_fold_construction():
+    # 8x1 两次 left：折叠面 cell 0 的叠层自上而下为 x=3, 4, 7, 0
+    # （第一步 x=4..7 翻面叠上，第二步整体右半再翻面叠上）
+    res = unfold_board(8, 1, ["left", "left"], [(0, 0)])
+    order = [None] * 4
+    for h in res["holes"]:
+        order[h["paths"][0]["layer"] - 1] = h["x"]
+    assert order == [3, 4, 7, 0]
+
+
+def test_depth_limits_to_top_layers():
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0)], [2])
+    assert res["total_holes"] == 2
+    assert res["unique_holes"] == 2
+    coords = {(h["x"], h["y"]): h["paths"][0]["layer"] for h in res["holes"]}
+    assert coords == {(1, 1): 1, (6, 1): 2}
+
+
+def test_depth_one_keeps_top_layer_only():
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0)], [1])
+    assert res["total_holes"] == 1
+    hole = res["holes"][0]
+    assert (hole["x"], hole["y"]) == (1, 1)
+    assert hole["paths"][0]["layer"] == 1
+
+
+def test_depth_equal_to_stack_matches_full_penetration():
+    full = unfold_board(8, 4, ["left", "down"], [(1, 0)])
+    limited = unfold_board(8, 4, ["left", "down"], [(1, 0)], [4])
+    assert limited["total_holes"] == full["total_holes"] == 4
+    assert {(h["x"], h["y"]) for h in limited["holes"]} == {
+        (h["x"], h["y"]) for h in full["holes"]
+    }
+
+
+def test_mixed_depths_per_punch():
+    # 打孔点 (0,1) 的叠层自上而下为 (0,0) (7,0) (7,3) (0,3)，depth=3 截掉最底层
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0), (0, 1)], [1, 3])
+    assert res["total_holes"] == 4
+    assert res["unique_holes"] == 4
+    coords = {(h["x"], h["y"]): h["paths"][0]["layer"] for h in res["holes"]}
+    assert coords == {(1, 1): 1, (0, 0): 1, (7, 0): 2, (7, 3): 3}
+    by_coord = {(h["x"], h["y"]): h for h in res["holes"]}
+    assert by_coord[(1, 1)]["paths"][0]["punch"] == 0
+    assert by_coord[(0, 0)]["paths"][0]["punch"] == 1
+
+
+def test_duplicate_points_different_depths_accumulate():
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0), (1, 0)], [1, 2])
+    assert res["total_holes"] == 3
+    assert res["unique_holes"] == 2
+    by_coord = {(h["x"], h["y"]): h for h in res["holes"]}
+    top = by_coord[(1, 1)]  # 两个打孔点的第 1 层在此重合
+    assert top["layers"] == 2
+    assert {p["punch"] for p in top["paths"]} == {0, 1}
+    assert {p["layer"] for p in top["paths"]} == {1}
+    second = by_coord[(6, 1)]  # 仅 depth=2 的打孔点到达第 2 层
+    assert second["layers"] == 1
+    assert second["paths"][0]["punch"] == 1
+    assert second["paths"][0]["layer"] == 2
+
+
+def test_no_folds_depth_must_be_one():
+    res = unfold_board(3, 3, [], [(2, 1)], [1])
+    assert res["holes"][0]["paths"][0]["layer"] == 1
+    with pytest.raises(FoldError) as exc_info:
+        unfold_board(3, 3, [], [(2, 1)], [2])
+    assert exc_info.value.code == "invalid_depth"
+
+
+def test_invalid_depth_rejected():
+    with pytest.raises(FoldError) as exc_info:
+        unfold_board(8, 4, ["left", "down"], [(1, 0)], [0])
+    assert exc_info.value.code == "invalid_depth"
+
+    with pytest.raises(FoldError) as exc_info:
+        unfold_board(8, 4, ["left", "down"], [(1, 0)], [5])  # 2 次折叠最多 4 层
+    err = exc_info.value
+    assert err.code == "invalid_depth"
+    assert err.context["punch"] == 0
+    assert err.context["depth"] == 5
+    assert err.context["max_depth"] == 4
+
+    with pytest.raises(FoldError) as exc_info:
+        unfold_board(8, 4, ["left", "down"], [(1, 0)], [1, 2])  # 数量不一致
+    assert exc_info.value.code == "invalid_depth"
+
+
 def test_fold_regions_sequence():
     regions = fold_regions(8, 4, ["left", "down"])
     assert [(r.x, r.y, r.width, r.height) for r in regions] == [
