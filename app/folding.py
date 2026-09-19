@@ -83,23 +83,41 @@ def unfold_board(
     width: int,
     height: int,
     folds: list[str],
-    punches: list[tuple[int, int]],
+    punches: list[tuple[int, int] | tuple[int, int, int]],
 ) -> dict:
-    """逆序展开折叠序列，通过镜像传播孔位。
+    """逆序展开折叠序列，通过镜像传播孔位，支持按最终层序限深打孔。
 
     参数：
         width/height：原始板材的整数网格尺寸。
         folds：按执行顺序给出的折叠方向序列。
-        punches：最终折叠面上的打孔点（折叠面局部坐标）。
+        punches：最终折叠面上的打孔点（折叠面局部坐标）；每项可为
+            (x, y) 或 (x, y, depth)。depth 取 1..2^折叠次数，表示只打穿
+            最终层序（自上而下编号）中最上面的 depth 层；省略则贯穿全部层。
+
+    层序构造：每一步折叠先把被移动半区翻面（其层序整体反转），再叠到
+    固定半区之上。因此第 k 步之后（自上而下）：
+        S_{k+1} = [前缀 + mirror（前缀按 S_k 逆序）] + [前缀 + stay（顺序不变）]
+    展开时每个分支对应 S_n 中的一个连续层块 [lo, lo+size)，仅保留
+    与 [0, depth) 相交的块，终点层号即路径中的 layer（从 1 开始）。
 
     返回：
         包含 final_face、stack_layers、total_holes、unique_holes、holes 的字典。
-        重合坐标被合并为一个 hole，其 paths 保留每一条传播路径。
+        重合坐标被合并为一个 hole，其 paths 保留每一条传播路径（含最终层号）。
     """
     regions = fold_regions(width, height, folds)
     final = regions[-1]
+    full_depth = 1 << len(folds)
 
-    for idx, (px, py) in enumerate(punches):
+    punch_points: list[tuple[int, int]] = []
+    depths: list[int] = []
+    explicit_depths: dict[int, int] = {}
+    for idx, raw in enumerate(punches):
+        if len(raw) == 2:
+            px, py = raw
+            depth = full_depth
+        else:
+            px, py, depth = raw
+            explicit_depths[idx] = depth
         if not (0 <= px < final.width and 0 <= py < final.height):
             raise FoldError(
                 "punch_out_of_bounds",
@@ -111,36 +129,78 @@ def unfold_board(
                 face_width=final.width,
                 face_height=final.height,
             )
+        if not isinstance(depth, int) or not (1 <= depth <= full_depth):
+            raise FoldError(
+                "invalid_punch_depth",
+                f"打孔点 #{idx} ({px}, {py}) 的 depth={depth!r} 非法："
+                f"合法取值为 1..{full_depth}（2^{len(folds)}），省略表示贯穿全部层。",
+                punch=idx,
+                x=px,
+                y=py,
+                depth=depth,
+                max_depth=full_depth,
+            )
+        punch_points.append((px, py))
+        depths.append(depth)
 
-    # 状态项：(x, y, 打孔点索引, 传播步骤)。步骤按展开顺序（最后一次折叠在前）追加。
-    states: list[tuple[int, int, int, list[dict]]] = [
-        (final.x + px, final.y + py, idx, []) for idx, (px, py) in enumerate(punches)
+    # 状态项：(x, y, 打孔点索引, 传播步骤, 层块下限, 层块大小, 层块是否倒序)。
+    # 层块 = 该分支在最终层序（自上而下 0 起编）中可覆盖的连续区间 [lo, lo+size)，
+    # rev 为真时前缀分支按逆序映射进该区间；步骤按展开顺序（最后一次折叠在前）追加。
+    states: list[tuple[int, int, int, list[dict], int, int, bool]] = [
+        (final.x + px, final.y + py, idx, [], 0, full_depth, False)
+        for idx, (px, py) in enumerate(punch_points)
     ]
 
     for i in range(len(folds) - 1, -1, -1):
         direction = folds[i]
         before = regions[i]  # 该次折叠之前（即展开之后）的区域
-        nxt: list[tuple[int, int, int, list[dict]]] = []
-        for x, y, idx, steps in states:
-            stay = {"fold": i, "direction": direction, "branch": "stay"}
-            mirror = {"fold": i, "direction": direction, "branch": "mirror"}
-            # 未移动的那一层：坐标不变
-            nxt.append((x, y, idx, steps + [stay]))
-            # 被折过来的那一层：关于折叠轴镜像
-            if direction in HORIZONTAL_FOLDS:
-                mx = 2 * before.x + before.width - 1 - x
-                nxt.append((mx, y, idx, steps + [mirror]))
+        nxt: list[tuple[int, int, int, list[dict], int, int, bool]] = []
+        for x, y, idx, steps, lo, size, rev in states:
+            half = size >> 1
+            depth = depths[idx]
+            # S_{k+1} 上半部为反转后的移动半区（mirror），下半部为固定半区（stay）；
+            # 父块倒序时两个子块位置互换，mirror 子块的相对序永远与父块相反。
+            if rev:
+                candidates = (
+                    ("stay", lo, True),
+                    ("mirror", lo + half, False),
+                )
             else:
-                my = 2 * before.y + before.height - 1 - y
-                nxt.append((x, my, idx, steps + [mirror]))
+                candidates = (
+                    ("mirror", lo, True),
+                    ("stay", lo + half, False),
+                )
+            for branch, blo, brev in candidates:
+                # 限深：层块完全落在 [depth, size) 之外时剪枝
+                if blo >= depth:
+                    continue
+                entry = {"fold": i, "direction": direction, "branch": branch}
+                if branch == "stay":
+                    # 未移动的那一层：坐标不变
+                    nx, ny = x, y
+                elif direction in HORIZONTAL_FOLDS:
+                    # 被折过来的那一层：关于竖直折叠轴镜像
+                    nx = 2 * before.x + before.width - 1 - x
+                    ny = y
+                else:
+                    # 关于水平折叠轴镜像
+                    nx = x
+                    ny = 2 * before.y + before.height - 1 - y
+                nxt.append((nx, ny, idx, steps + [entry], blo, half, brev))
         states = nxt
 
     # 合并重合坐标，保留各自传播路径
     merged: dict[tuple[int, int], list[dict]] = {}
-    for x, y, idx, steps in states:
+    for x, y, idx, steps, lo, _size, _rev in states:
+        punch_point = {"x": punch_points[idx][0], "y": punch_points[idx][1]}
+        # 仅回显请求中显式给出的 depth，省略时不输出该字段
+        if idx in explicit_depths:
+            punch_point["depth"] = explicit_depths[idx]
         path = {
             "punch": idx,
-            "punch_point": {"x": punches[idx][0], "y": punches[idx][1]},
+            "punch_point": punch_point,
+            # 终点层块大小为 1，lo 即该分支在最终层序中的 0 基下标
+            "layer": lo + 1,
             # 反转为请求中折叠的原始顺序，便于阅读
             "steps": list(reversed(steps)),
         }
@@ -157,7 +217,7 @@ def unfold_board(
             "width": final.width,
             "height": final.height,
         },
-        "stack_layers": 1 << len(folds),
+        "stack_layers": full_depth,
         "total_holes": len(states),
         "unique_holes": len(holes),
         "holes": holes,

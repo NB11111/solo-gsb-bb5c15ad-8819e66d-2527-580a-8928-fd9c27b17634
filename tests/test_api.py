@@ -247,3 +247,150 @@ def test_punch_plan_negative_coordinate_returns_422():
         },
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 限深打孔
+# ---------------------------------------------------------------------------
+
+
+def test_unfold_depth_one():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "punches": [{"x": 1, "y": 0, "depth": 1}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_holes"] == 1
+    assert body["unique_holes"] == 1
+    hole = body["holes"][0]
+    assert (hole["x"], hole["y"]) == (1, 1)
+    path = hole["paths"][0]
+    assert path["layer"] == 1
+    assert path["punch_point"] == {"x": 1, "y": 0, "depth": 1}
+
+
+def test_unfold_depth_two():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "punches": [{"x": 1, "y": 0, "depth": 2}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_holes"] == 2
+    coords = {
+        (h["x"], h["y"]): h["paths"][0]["layer"] for h in body["holes"]
+    }
+    assert coords == {(1, 1): 1, (6, 1): 2}
+
+
+def test_unfold_depth_full_same_as_omitted():
+    common = {"board": {"width": 8, "height": 4}, "folds": ["left", "down"]}
+    omitted = client.post(
+        "/api/v1/unfold", json={**common, "punches": [{"x": 1, "y": 0}]}
+    ).json()
+    full = client.post(
+        "/api/v1/unfold",
+        json={**common, "punches": [{"x": 1, "y": 0, "depth": 4}]},
+    ).json()
+    assert full["total_holes"] == omitted["total_holes"] == 4
+    assert {(h["x"], h["y"]) for h in full["holes"]} == {
+        (h["x"], h["y"]) for h in omitted["holes"]
+    }
+    # 省略 depth 的请求/响应均不携带 depth 字段
+    assert omitted["holes"][0]["paths"][0]["punch_point"] == {"x": 1, "y": 0}
+    assert full["holes"][0]["paths"][0]["punch_point"] == {"x": 1, "y": 0, "depth": 4}
+    for h in omitted["holes"]:
+        assert "layer" in h["paths"][0]
+
+
+def test_unfold_duplicate_punches_different_depth_accumulate():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "punches": [
+                {"x": 1, "y": 0, "depth": 1},
+                {"x": 1, "y": 0},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_holes"] == 5
+    top = next(h for h in body["holes"] if (h["x"], h["y"]) == (1, 1))
+    assert top["layers"] == 2
+    assert len(top["paths"]) == 2
+    assert {p["punch"] for p in top["paths"]} == {0, 1}
+    assert all(p["layer"] == 1 for p in top["paths"])
+
+
+def test_unfold_depth_too_large_returns_422():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 4, "height": 1},
+            "folds": ["left"],
+            "punches": [{"x": 0, "y": 0, "depth": 3}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_unfold_depth_zero_returns_422():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 4, "height": 1},
+            "folds": ["left"],
+            "punches": [{"x": 0, "y": 0, "depth": 0}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_unfold_depth_negative_returns_422():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 4, "height": 4},
+            "folds": [],
+            "punches": [{"x": 0, "y": 0, "depth": -1}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_unfold_depth_one_without_folds_ok():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 4, "height": 4},
+            "folds": [],
+            "punches": [{"x": 0, "y": 0, "depth": 1}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["holes"][0]["paths"][0]["layer"] == 1
+
+
+def test_unfold_depth_exceeds_stack_no_folds_returns_422():
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 4, "height": 4},
+            "folds": [],
+            "punches": [{"x": 0, "y": 0, "depth": 2}],
+        },
+    )
+    assert resp.status_code == 422

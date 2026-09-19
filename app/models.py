@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Literal
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class FoldDirection(str, Enum):
@@ -26,6 +26,14 @@ class PunchPoint(BaseModel):
 
     x: int = Field(..., ge=0, examples=[1])
     y: int = Field(..., ge=0, examples=[0])
+    depth: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "限深打孔：只打穿最终层序（自上而下编号）中最上面的 depth 层，"
+            "合法取值 1..2^折叠次数；省略表示贯穿全部层。"
+        ),
+    )
 
 
 class UnfoldRequest(BaseModel):
@@ -39,8 +47,19 @@ class UnfoldRequest(BaseModel):
         ...,
         min_length=1,
         max_length=1024,
-        description="最终折叠面上的打孔点（局部坐标）",
+        description="最终折叠面上的打孔点（局部坐标），可选 depth 限深",
     )
+
+    @model_validator(mode="after")
+    def _validate_punch_depths(self) -> "UnfoldRequest":
+        max_depth = 1 << len(self.folds)
+        for idx, punch in enumerate(self.punches):
+            if punch.depth is not None and punch.depth > max_depth:
+                raise ValueError(
+                    f"punches[{idx}].depth={punch.depth} 超过 2^折叠次数={max_depth}，"
+                    f"合法取值为 1..{max_depth}，省略表示贯穿全部层。"
+                )
+        return self
 
     model_config = {
         "json_schema_extra": {
@@ -70,6 +89,14 @@ class HolePath(BaseModel):
 
     punch: int = Field(..., description="对应请求中 punches 的下标")
     punch_point: PunchPoint
+    layer: int = Field(
+        ...,
+        ge=1,
+        description=(
+            "该分支命中的最终层号（折叠栈自上而下、从 1 开始编号）；"
+            "省略 depth 时覆盖全部层，带 depth 时仅覆盖前 depth 层"
+        ),
+    )
     steps: List[PathStep]
 
 

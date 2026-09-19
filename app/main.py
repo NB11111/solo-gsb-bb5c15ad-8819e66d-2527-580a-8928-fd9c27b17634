@@ -22,10 +22,10 @@ MAX_TOTAL_HOLES = int(os.environ.get("MAX_TOTAL_HOLES", "200000"))
 
 app = FastAPI(
     title="包装板材折叠打孔模板展开 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
-        "提交整数网格矩形板材、依次执行的对折方向序列以及最终折叠面上的打孔点，"
-        "服务端逆序展开折叠并镜像传播孔位，返回展开后的唯一孔位、覆盖层数与来源路径。"
+        "提交整数网格矩形板材、依次执行的对折方向序列以及最终折叠面上的打孔点（可选 depth 限深），"
+        "服务端逆序展开折叠并镜像传播孔位，返回展开后的唯一孔位、覆盖层数与来源路径（含最终层号）。"
         "另提供反向打孔规划：由期望的展开孔位反推最终折叠面上的最小打孔点集合。"
     ),
 )
@@ -44,6 +44,7 @@ def health() -> dict:
 @app.post(
     "/api/v1/unfold",
     response_model=UnfoldResponse,
+    response_model_exclude_none=True,
     responses={400: {"model": ErrorResponse, "description": "领域校验失败"}},
 )
 def unfold(req: UnfoldRequest) -> dict:
@@ -77,7 +78,10 @@ def unfold(req: UnfoldRequest) -> dict:
         )
 
     folds = [f.value for f in req.folds]
-    punches = [(p.x, p.y) for p in req.punches]
+    punches = [
+        (p.x, p.y) if p.depth is None else (p.x, p.y, p.depth)
+        for p in req.punches
+    ]
     try:
         result = unfold_board(req.board.width, req.board.height, folds, punches)
     except FoldError as exc:
@@ -92,6 +96,7 @@ def unfold(req: UnfoldRequest) -> dict:
 @app.post(
     "/api/v1/punch-plan",
     response_model=PunchPlanResponse,
+    response_model_exclude_none=True,
     responses={400: {"model": ErrorResponse, "description": "领域校验失败"}},
 )
 def punch_plan(req: PunchPlanRequest) -> dict:

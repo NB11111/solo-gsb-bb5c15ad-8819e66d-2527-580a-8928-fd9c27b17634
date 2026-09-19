@@ -2,7 +2,9 @@
 
 基于 Python + FastAPI 的 HTTP 服务：客户端提交整数网格矩形板材、依次执行的上下/左右对折方向，以及最终折叠面上的打孔点；服务端**逆序展开**折叠序列，通过**镜像传播**孔位，自动**拒绝当前折叠轴长度为奇数**的折叠步骤，并将展开后**重合的坐标合并**（各自传播路径完整保留）。
 
-返回内容：展开后的唯一孔位、每个孔位的覆盖层数，以及每个孔位的来源路径（来自哪个打孔点、每一步折叠走了哪一侧）。
+返回内容：展开后的唯一孔位、每个孔位的覆盖层数，以及每个孔位的来源路径（来自哪个打孔点、命中最终折叠栈的哪一层、每一步折叠走了哪一侧）。
+
+打孔点支持可选 **`depth` 限深**：取值 `1..2^折叠次数`，表示只打穿最终折叠栈（自上而下编号）最上面的 `depth` 层；省略时保持原有行为，贯穿全部层。
 
 另提供**反向打孔规划**接口：提交期望在展开板材上出现的目标孔位，服务端沿折叠过程将目标归并到最终折叠面的等价位置，复算校验镜像轨道完整后，返回最小且唯一的打孔点列表。
 
@@ -53,6 +55,14 @@ docker compose up --build
 | `board` | 原始板材的整数网格尺寸，`width`/`height` 为正整数 |
 | `folds` | 按执行顺序给出的对折方向：`up` / `down` / `left` / `right`，可为空数组 |
 | `punches` | 最终折叠面上的打孔点，使用折叠面**局部坐标**（左上角为 `(0,0)`），至少 1 个 |
+| `punches[].depth` | 可选，限深打孔：只打穿最终折叠栈自上而下最上面的 `depth` 层，合法取值 `1..2^折叠次数`（无折叠时仅为 `1`）；省略表示贯穿全部层 |
+
+**层序与限深语义**
+
+- 每一步折叠先把**被移动半区翻面**（其内部层序整体反转），再叠到**固定半区之上**。
+- 最终折叠栈自上而下编号 `1..2^折叠次数`；每个孔位路径中的 `layer` 即该分支命中的最终层号。
+- 带 `depth` 时，孔位只传播到前 `depth` 层对应的原板坐标；省略 `depth`（或取满 `2^折叠次数`）时传播到全部层。
+- 多个打孔点（含重复点或不同 `depth`）命中同一原板坐标时，该坐标的 `layers` 累计、`paths` 保留全部来源路径。
 
 **坐标与折叠语义约定**
 
@@ -78,6 +88,7 @@ docker compose up --build
         {
           "punch": 0,
           "punch_point": { "x": 1, "y": 0 },
+          "layer": 1,
           "steps": [
             { "fold": 0, "direction": "left", "branch": "stay" },
             { "fold": 1, "direction": "down", "branch": "mirror" }
@@ -94,8 +105,46 @@ docker compose up --build
 | `final_face` | 最终折叠面在原始板材坐标系中的位置与尺寸 |
 | `stack_layers` | 折叠后每处的纸层数 = 2^折叠步数 |
 | `total_holes` / `unique_holes` | 展开孔位总数（按路径计）/ 去重后的唯一孔位数 |
-| `holes[].layers` | 覆盖该坐标的传播路径数（重合次数） |
-| `holes[].paths[]` | 来源路径：`punch` 为请求中打孔点下标；`steps` 按折叠原始顺序记录每一步的分支，`stay` = 未移动的一层，`mirror` = 被折过来的一层 |
+| `holes[].layers` | 覆盖该坐标的传播路径数（重合次数，含限深累计） |
+| `holes[].paths[]` | 来源路径：`punch` 为请求中打孔点下标；`layer` 为该分支命中的最终层号（自上而下从 1 开始）；`steps` 按折叠原始顺序记录每一步的分支，`stay` = 未移动的一层，`mirror` = 被折过来的一层；请求中显式给出的 `depth` 会在 `punch_point` 中原样回显，省略时不输出 |
+
+**限深打孔示例**
+
+请求把同一个打孔点的深度限制为 2（`8x4` 板材，`left` 后 `down`），最终只展开最上面两层：
+
+```json
+{
+  "board": { "width": 8, "height": 4 },
+  "folds": ["left", "down"],
+  "punches": [{ "x": 1, "y": 0, "depth": 2 }]
+}
+```
+
+响应（节选）：层 1 落在原板 `(1, 1)`（`left` 折时留在固定半区、`down` 折时随被移动半区翻面到最上），层 2 落在 `(6, 1)`，其余两层不再展开。
+
+```json
+{
+  "stack_layers": 4,
+  "total_holes": 2,
+  "unique_holes": 2,
+  "holes": [
+    {
+      "x": 1, "y": 1, "layers": 1,
+      "paths": [{ "punch": 0, "punch_point": { "x": 1, "y": 0, "depth": 2 }, "layer": 1,
+        "steps": [{ "fold": 0, "direction": "left", "branch": "stay" },
+                  { "fold": 1, "direction": "down", "branch": "mirror" }] }]
+    },
+    {
+      "x": 6, "y": 1, "layers": 1,
+      "paths": [{ "punch": 0, "punch_point": { "x": 1, "y": 0, "depth": 2 }, "layer": 2,
+        "steps": [{ "fold": 0, "direction": "left", "branch": "mirror" },
+                  { "fold": 1, "direction": "down", "branch": "mirror" }] }]
+    }
+  ]
+}
+```
+
+同一点分别以 `depth: 1` 和不带 `depth` 各打一次时，层 1 坐标的 `layers` 为 2、`paths` 保留两条来源（层号均为 1），其余坐标各保留贯穿打孔产生的一条路径。
 
 **curl 示例**
 
@@ -114,7 +163,7 @@ curl -X POST http://localhost:8000/api/v1/unfold \
 - `400 odd_fold_axis`：某一步折叠时当前轴长为奇数，`detail` 中带 `step` / `direction` / `axis` / `axis_length`。
 - `400 punch_out_of_bounds`：打孔点超出最终折叠面范围。
 - `400 limit_exceeded`：超出 `MAX_FOLDS` / `MAX_PUNCHES` / `MAX_TOTAL_HOLES` 限制。
-- `422`：请求体不符合 schema（如非法方向、负坐标、空打孔列表）。
+- `422`：请求体不符合 schema（如非法方向、负坐标、空打孔列表，或 `depth` 不是 1..2^折叠次数之间的整数）。
 
 ```json
 {

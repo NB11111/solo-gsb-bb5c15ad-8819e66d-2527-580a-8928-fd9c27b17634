@@ -210,3 +210,198 @@ def test_plan_punches_limit_exceeded():
     with pytest.raises(FoldError) as exc_info:
         plan_punches(4, 4, ["left"], [(0, 0), (1, 0)], max_total_holes=3)
     assert exc_info.value.code == "limit_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# 限深打孔
+# ---------------------------------------------------------------------------
+
+
+def _stack_order(width, height, folds, local_x=0, local_y=0):
+    """按真实折叠构造参考层序：返回打孔点处自上而下的 [(原板坐标, 分支序列)]。
+
+    为折叠面上的每个物理格子维护一个自上而下的层栈；每步折叠时，
+    移动半区的来源栈反转并追加 mirror，叠到固定半区来源栈（追加 stay）之上。
+    """
+    from app.folding import fold_regions
+
+    regions = fold_regions(width, height, folds)
+    stacks: dict[tuple[int, int], list[tuple[tuple[int, int], tuple]]] = {
+        (x, y): [((x, y), ())] for x in range(width) for y in range(height)
+    }
+    for i, direction in enumerate(folds):
+        before = regions[i]
+        after = regions[i + 1]
+        nxt: dict[tuple[int, int], list[tuple[tuple[int, int], tuple]]] = {}
+        for ax in range(after.x, after.x + after.width):
+            for ay in range(after.y, after.y + after.height):
+                if direction in ("left", "right"):
+                    mx, my = 2 * before.x + before.width - 1 - ax, ay
+                else:
+                    mx, my = ax, 2 * before.y + before.height - 1 - ay
+                moved = [
+                    (coord, seq + ("mirror",)) for coord, seq in reversed(stacks[(mx, my)])
+                ]
+                fixed = [
+                    (coord, seq + ("stay",)) for coord, seq in stacks[(ax, ay)]
+                ]
+                nxt[(ax, ay)] = moved + fixed
+        stacks = nxt
+    final = regions[-1]
+    return stacks[(final.x + local_x, final.y + local_y)]
+
+
+def test_paths_carry_final_layer_number():
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0)])
+    reference = {coord: idx + 1 for idx, (coord, _seq) in enumerate(_stack_order(8, 4, ["left", "down"], 1, 0))}
+    seen_layers = set()
+    for hole in res["holes"]:
+        for path in hole["paths"]:
+            assert path["layer"] == reference[(hole["x"], hole["y"])]
+            seen_layers.add(path["layer"])
+    assert seen_layers == {1, 2, 3, 4}
+
+
+def test_depth_one_keeps_top_layer_only():
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0, 1)])
+    assert res["total_holes"] == 1
+    assert res["unique_holes"] == 1
+    hole = res["holes"][0]
+    # 顶层层号 1：left 折时留在固定半区，down 折时被翻面叠到最上
+    assert (hole["x"], hole["y"]) == (1, 1)
+    assert hole["layers"] == 1
+    path = hole["paths"][0]
+    assert path["layer"] == 1
+    assert [s["branch"] for s in path["steps"]] == ["stay", "mirror"]
+
+
+def test_depth_two_keeps_top_two_layers():
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0, 2)])
+    assert res["total_holes"] == 2
+    by_coord = {(h["x"], h["y"]): h for h in res["holes"]}
+    assert set(by_coord) == {(1, 1), (6, 1)}
+    assert by_coord[(1, 1)]["paths"][0]["layer"] == 1
+    assert by_coord[(6, 1)]["paths"][0]["layer"] == 2
+
+
+def test_depth_three_asymmetric_split():
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0, 3)])
+    assert res["total_holes"] == 3
+    by_coord = {(h["x"], h["y"]): h for h in res["holes"]}
+    assert set(by_coord) == {(1, 1), (6, 1), (6, 2)}
+    assert by_coord[(6, 2)]["paths"][0]["layer"] == 3
+
+
+def test_depth_full_equals_omitted():
+    full = unfold_board(8, 4, ["left", "down"], [(1, 0, 4)])
+    omitted = unfold_board(8, 4, ["left", "down"], [(1, 0)])
+    expected = {(1, 1, 1), (6, 1, 2), (6, 2, 3), (1, 2, 4)}
+    for res in (full, omitted):
+        assert res["total_holes"] == 4
+        assert {
+            (h["x"], h["y"], p["layer"])
+            for h in res["holes"]
+            for p in h["paths"]
+        } == expected
+    # 孔位/层号/路径完全一致，唯一区别是显式 depth 在 punch_point 中回显
+    def normalize(res):
+        return [
+            {
+                "x": h["x"],
+                "y": h["y"],
+                "layers": h["layers"],
+                "paths": [
+                    {k: v for k, v in p.items() if k != "punch_point"}
+                    for p in h["paths"]
+                ],
+            }
+            for h in res["holes"]
+        ]
+
+    assert normalize(full) == normalize(omitted)
+
+
+def test_depth_semantics_other_directions():
+    # 4x1 右折：左半被翻面叠到右半之上，punch 位于面 x=2（局部 0），
+    # 顶层来自被翻面的左半 -> 原 x=1，底层为固定半区 x=2
+    res = unfold_board(4, 1, ["right"], [(0, 0, 1)])
+    assert [(h["x"], h["y"]) for h in res["holes"]] == [(1, 0)]
+    assert res["holes"][0]["paths"][0]["layer"] == 1
+    res2 = unfold_board(4, 1, ["right"], [(0, 0, 2)])
+    assert {(h["x"], h["y"]) for h in res2["holes"]} == {(1, 0), (2, 0)}
+
+    # 1x4 上折：下半被翻面叠到上半之上，面 y∈[0,2)，punch 局部 (0,1)：
+    # 顶层来自被翻面的下半 -> 原 y=2，底层为固定半区 y=1
+    res3 = unfold_board(1, 4, ["up"], [(0, 1, 1)])
+    assert [(h["x"], h["y"]) for h in res3["holes"]] == [(0, 2)]
+    res4 = unfold_board(1, 4, ["up"], [(0, 1, 2)])
+    assert {(h["x"], h["y"]) for h in res4["holes"]} == {(0, 1), (0, 2)}
+
+
+def test_depth_no_folds():
+    res = unfold_board(3, 3, [], [(2, 1, 1)])
+    hole = res["holes"][0]
+    assert (hole["x"], hole["y"], hole["layers"]) == (2, 1, 1)
+    assert hole["paths"][0]["layer"] == 1
+
+
+def test_same_punch_different_depth_accumulates_layers():
+    # 同一点 depth=1 与贯穿同时打孔：层1 坐标重合，layers 累计为 2，保留两条来源
+    res = unfold_board(8, 4, ["left", "down"], [(1, 0, 1), (1, 0)])
+    assert res["total_holes"] == 5
+    by_coord = {(h["x"], h["y"]): h for h in res["holes"]}
+    top = by_coord[(1, 1)]
+    assert top["layers"] == 2
+    assert len(top["paths"]) == 2
+    assert {p["punch"] for p in top["paths"]} == {0, 1}
+    assert {p["layer"] for p in top["paths"]} == {1}
+    # 其余三个坐标只由贯穿打孔（punch #1）产生
+    for coord in ((6, 1), (6, 2), (1, 2)):
+        hole = by_coord[coord]
+        assert hole["layers"] == 1
+        assert hole["paths"][0]["punch"] == 1
+
+
+def test_depth_keeps_only_top_depth_against_reference():
+    # 与独立的显式层序构造交叉校验：depth 恰好保留前 depth 层对应原板坐标
+    folds = ["right", "up", "left"]
+    width, height = 8, 4
+    px, py = 0, 0
+    layers = _stack_order(width, height, folds, px, py)
+    for depth in range(1, 9):
+        res = unfold_board(width, height, folds, [(px, py, depth)])
+        expected_coords = {coord for coord, _seq in layers[:depth]}
+        actual = {(h["x"], h["y"]) for h in res["holes"]}
+        assert actual == expected_coords
+        assert res["total_holes"] == depth
+        layer_by_coord = {
+            (h["x"], h["y"]): h["paths"][0]["layer"] for h in res["holes"]
+        }
+        for layer_no, (coord, _seq) in enumerate(layers[:depth], start=1):
+            assert layer_by_coord[coord] == layer_no
+
+
+def test_invalid_depth_zero_and_negative():
+    with pytest.raises(FoldError) as exc_info:
+        unfold_board(8, 4, ["left", "down"], [(1, 0, 0)])
+    err = exc_info.value
+    assert err.code == "invalid_punch_depth"
+    assert err.context["punch"] == 0
+    assert err.context["max_depth"] == 4
+
+    with pytest.raises(FoldError):
+        unfold_board(4, 1, ["left"], [(0, 0, -1)])
+
+
+def test_invalid_depth_above_stack_layers():
+    with pytest.raises(FoldError) as exc_info:
+        unfold_board(4, 1, ["left"], [(0, 0, 3)])  # 仅 2 层
+    err = exc_info.value
+    assert err.code == "invalid_punch_depth"
+    assert err.context["depth"] == 3
+    assert err.context["max_depth"] == 2
+
+
+def test_invalid_depth_no_folds():
+    with pytest.raises(FoldError):
+        unfold_board(3, 3, [], [(0, 0, 2)])
